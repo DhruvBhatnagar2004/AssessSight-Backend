@@ -9,16 +9,23 @@ const app = express();
 let isConnected = false;
 
 const connectDB = async () => {
-  if (isConnected) {
+  if (isConnected && mongoose.connection.readyState === 1) {
     console.log('Using existing database connection');
     return;
   }
 
   try {
+    console.log('Attempting MongoDB connection...');
+    
+    // Check if MONGO_URI is available
+    if (!process.env.MONGO_URI) {
+      throw new Error('MONGO_URI environment variable is not set');
+    }
+    
     const options = {
       useNewUrlParser: true,
       useUnifiedTopology: true,
-      serverSelectionTimeoutMS: 15000,
+      serverSelectionTimeoutMS: 10000, // Reduced timeout for faster failure
       socketTimeoutMS: 45000,
       maxPoolSize: 10,
       minPoolSize: 1,
@@ -32,7 +39,12 @@ const connectDB = async () => {
     console.log('✅ MongoDB connected successfully');
     
   } catch (error) {
-    console.error('❌ MongoDB connection failed:', error.message);
+    console.error('❌ MongoDB connection failed:', {
+      message: error.message,
+      mongoUri: process.env.MONGO_URI ? 'Set' : 'Not set',
+      nodeEnv: process.env.NODE_ENV
+    });
+    isConnected = false;
     throw error;
   }
 };
@@ -66,41 +78,55 @@ app.use(async (req, res, next) => {
     await connectDB();
     next();
   } catch (error) {
-    console.error('Database connection error:', error);
-    res.status(503).json({ 
+    console.error('Database connection error in middleware:', error.message);
+    return res.status(503).json({ 
       message: 'Database connection unavailable',
-      error: process.env.NODE_ENV === 'development' ? error.message : 'Service unavailable'
+      error: 'Service unavailable',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
 
-// Health check
-app.get('/api/health', (req, res) => {
-  const dbStatus = mongoose.connection.readyState;
-  const dbStates = {
-    0: 'disconnected',
-    1: 'connected',
-    2: 'connecting',
-    3: 'disconnecting'
-  };
-  
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    database: dbStates[dbStatus] || 'unknown',
-    environment: process.env.NODE_ENV || 'development',
-    vercel: !!process.env.VERCEL
-  });
+// Health check with better diagnostics
+app.get('/api/health', async (req, res) => {
+  try {
+    const dbStatus = mongoose.connection.readyState;
+    const dbStates = {
+      0: 'disconnected',
+      1: 'connected',
+      2: 'connecting',
+      3: 'disconnecting'
+    };
+    
+    // Test database connection
+    if (dbStatus === 1) {
+      await mongoose.connection.db.admin().ping();
+    }
+    
+    res.json({ 
+      status: 'ok', 
+      timestamp: new Date().toISOString(),
+      database: dbStates[dbStatus] || 'unknown',
+      environment: process.env.NODE_ENV || 'development',
+      vercel: !!process.env.VERCEL,
+      mongoUri: process.env.MONGO_URI ? 'Set' : 'Not set'
+    });
+  } catch (error) {
+    console.error('Health check failed:', error);
+    res.status(500).json({
+      status: 'error',
+      message: 'Health check failed',
+      error: error.message
+    });
+  }
 });
 
 // Mount routers
-const scanRouter = require('./scan');
-const historyRouter = require('./history');
 const authRouter = require('./auth');
+const scanRouter = require('./scan');
 
-app.use('/api/scan', scanRouter);
-app.use('/api/history', historyRouter);
 app.use('/api/auth', authRouter);
+app.use('/api/scan', scanRouter);
 
 // Global error handler
 app.use((err, req, res, next) => {
@@ -108,8 +134,7 @@ app.use((err, req, res, next) => {
     message: err.message,
     stack: err.stack,
     url: req.url,
-    method: req.method,
-    body: req.body
+    method: req.method
   });
   
   res.status(500).json({ 
